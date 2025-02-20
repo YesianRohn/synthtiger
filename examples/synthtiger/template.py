@@ -9,6 +9,7 @@ import os
 import cv2
 import numpy as np
 from PIL import Image
+import io
 
 from synthtiger import components, layers, templates, utils
 
@@ -27,6 +28,11 @@ BLEND_MODES = [
     "lighten_only",
 ]
 
+def writeCache(env, cache):
+    """Write the cache to the LMDB database."""
+    with env.begin(write=True) as txn:
+        for k, v in cache.items():
+            txn.put(k, v)
 
 class SynthTiger(templates.Template):
     def __init__(self, config=None):
@@ -37,7 +43,7 @@ class SynthTiger(templates.Template):
         self.mask_output = config.get("mask_output", True)
         self.glyph_coord_output = config.get("glyph_coord_output", True)
         self.glyph_mask_output = config.get("glyph_mask_output", True)
-        self.vertical = config.get("vertical", False)
+        self.vertical_rate = config.get("vertical_rate", 0)
         self.quality = config.get("quality", [95, 95])
         self.visibility_check = config.get("visibility_check", False)
         self.midground = config.get("midground", 0)
@@ -193,6 +199,50 @@ class SynthTiger(templates.Template):
         if self.glyph_coord_output:
             self.glyph_coords_file.write(f"{image_key}\t{glyph_coords}\n")
 
+    def save_lmdb(self, root, data, env, cache, cnt, write_frequency=1000):
+        """
+        Save data to LMDB database.
+        
+        Args:
+            root (str): Root path for the LMDB database.
+            data (dict): Data dictionary containing the image, label, mask, etc.
+            env (lmdb.Environment): LMDB environment instance.
+            cache (dict): Cache to batch writes into LMDB.
+            cnt (int): Counter for the current sample.
+            write_frequency (int): Number of samples to batch before writing to LMDB.
+        
+        Returns:
+            cache, cnt: Updated cache and counter.
+        """
+        image = data["image"]
+        label = data["label"]
+        quality = data["quality"]
+
+        # Convert numpy arrays to PIL Images
+        image = Image.fromarray(image[..., :3].astype(np.uint8))
+        w, h = image.size
+
+        # Save images to byte buffers
+        image_buf = io.BytesIO()
+        image.save(image_buf, format="JPEG", quality=quality)
+
+        # Create keys for LMDB
+        image_key = 'image-%09d'.encode() % cnt
+        label_key = 'label-%09d'.encode() % cnt
+        wh_key = 'wh-%09d'.encode() % cnt
+
+        # Add data to cache
+        cache[image_key] = image_buf.getvalue()
+        cache[label_key] = label.encode()
+        cache[wh_key] = (str(w) + '_' + str(h)).encode()
+
+        # Write cache to LMDB if write_frequency is reached
+        if cnt % write_frequency == 0:
+            writeCache(env, cache)
+            cache = {}
+
+        return cache, cnt + 1
+
     def end_save(self, root):
         self.gt_file.close()
         if self.coord_output:
@@ -219,12 +269,16 @@ class SynthTiger(templates.Template):
         # for script using diacritic, ligature and RTL
         chars = utils.split_text(label, reorder=True)
 
+        is_vertical = False
+        if np.random.rand() < self.vertical_rate:
+            is_vertical = True
+
         text = "".join(chars)
-        font = self.font.sample({"text": text, "vertical": self.vertical})
+        font = self.font.sample({"text": text, "vertical": is_vertical})
 
         char_layers = [layers.TextLayer(char, **font) for char in chars]
         self.shape.apply(char_layers)
-        self.layout.apply(char_layers, {"meta": {"vertical": self.vertical}})
+        self.layout.apply(char_layers, {"meta": {"vertical": is_vertical}})
         char_glyph_layers = [char_layer.copy() for char_layer in char_layers]
 
         text_layer = layers.Group(char_layers).merge()
